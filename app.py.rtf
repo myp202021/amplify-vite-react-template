@@ -1,0 +1,778 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2639
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx566\tx1133\tx1700\tx2267\tx2834\tx3401\tx3968\tx4535\tx5102\tx5669\tx6236\tx6803\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request\
+from fastapi.middleware.cors import CORSMiddleware\
+from fastapi.staticfiles import StaticFiles\
+from fastapi.templating import Jinja2Templates\
+from pydantic import BaseModel, EmailStr\
+from typing import Optional, Dict, List, Any\
+import sqlite3\
+import asyncio\
+import httpx\
+import pandas as pd\
+import numpy as np\
+from datetime import datetime, timedelta\
+import os\
+import random\
+from bs4 import BeautifulSoup\
+from fake_useragent import UserAgent\
+import time\
+from transformers import pipeline\
+import json\
+import re\
+import logging\
+from uuid import uuid4\
+\
+# Configuraci\'f3n de logging\
+logging.basicConfig(level=logging.INFO, \
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')\
+logger = logging.getLogger("radar_mp")\
+\
+# Inicializaci\'f3n de la aplicaci\'f3n FastAPI\
+app = FastAPI(\
+    title="Radar de Percepci\'f3n Digital M&P",\
+    description="API para an\'e1lisis de reputaci\'f3n digital de marcas chilenas",\
+    version="1.0.0"\
+)\
+\
+# Middleware CORS para permitir solicitudes desde el frontend\
+app.add_middleware(\
+    CORSMiddleware,\
+    allow_origins=["*"],  # En producci\'f3n, limitar a dominios espec\'edficos\
+    allow_credentials=True,\
+    allow_methods=["*"],\
+    allow_headers=["*"],\
+)\
+\
+# Configuraci\'f3n de plantillas y archivos est\'e1ticos\
+templates = Jinja2Templates(directory="templates")\
+app.mount("/static", StaticFiles(directory="static"), name="static")\
+\
+# Modelos de datos\
+class BrandSearch(BaseModel):\
+    brand: str\
+    name: str\
+    company: str\
+    email: EmailStr\
+    phone: str\
+\
+class SearchResult(BaseModel):\
+    task_id: str\
+    status: str\
+    message: str\
+    data: Optional[Dict[str, Any]] = None\
+\
+# Diccionario para almacenar tareas en progreso\
+active_tasks: Dict[str, asyncio.Task] = \{\}\
+\
+# Conexi\'f3n a base de datos\
+DB_PATH = "radar_mp.db"\
+\
+def get_db_connection():\
+    """Establecer conexi\'f3n a la base de datos SQLite"""\
+    conn = sqlite3.connect(DB_PATH)\
+    conn.row_factory = sqlite3.Row\
+    return conn\
+\
+def init_db():\
+    """Inicializa la base de datos con las tablas necesarias"""\
+    conn = get_db_connection()\
+    cursor = conn.cursor()\
+    \
+    # Tabla de usuarios y b\'fasquedas\
+    cursor.execute('''\
+    CREATE TABLE IF NOT EXISTS users (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT,\
+        name TEXT NOT NULL,\
+        company TEXT NOT NULL,\
+        email TEXT NOT NULL UNIQUE,\
+        phone TEXT NOT NULL,\
+        last_search TIMESTAMP,\
+        search_count INTEGER DEFAULT 0\
+    )\
+    ''')\
+    \
+    # Tabla de menciones\
+    cursor.execute('''\
+    CREATE TABLE IF NOT EXISTS mentions (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT,\
+        brand TEXT NOT NULL,\
+        source TEXT NOT NULL,\
+        url TEXT NOT NULL,\
+        text TEXT NOT NULL, \
+        date TIMESTAMP NOT NULL,\
+        sentiment REAL NOT NULL,\
+        weight REAL NOT NULL,\
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\
+    )\
+    ''')\
+    \
+    # Tabla de puntajes de marca\
+    cursor.execute('''\
+    CREATE TABLE IF NOT EXISTS brand_scores (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT,\
+        brand TEXT NOT NULL,\
+        imrd_score REAL NOT NULL,\
+        mention_count INTEGER NOT NULL,\
+        positive_ratio REAL NOT NULL,\
+        negative_ratio REAL NOT NULL,\
+        neutral_ratio REAL NOT NULL,\
+        industry TEXT,\
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP\
+    )\
+    ''')\
+    \
+    # Tabla de fuentes\
+    cursor.execute('''\
+    CREATE TABLE IF NOT EXISTS sources (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT,\
+        name TEXT NOT NULL UNIQUE,\
+        url TEXT NOT NULL,\
+        category TEXT NOT NULL,\
+        weight REAL NOT NULL\
+    )\
+    ''')\
+    \
+    # Insertar las fuentes predefinidas desde la configuraci\'f3n\
+    insert_predefined_sources(cursor)\
+    \
+    conn.commit()\
+    conn.close()\
+    \
+    logger.info("Base de datos inicializada correctamente")\
+\
+def insert_predefined_sources(cursor):\
+    """Inserta las fuentes predefinidas en la base de datos"""\
+    # Ejemplo de algunas fuentes, basadas en la lista proporcionada\
+    sources = [\
+        # Medios Digitales Nacionales\
+        ("Emol", "https://www.emol.com", "news", 2.0),\
+        ("La Tercera", "https://www.latercera.com", "news", 2.0),\
+        ("BioBioChile", "https://www.biobiochile.cl", "news", 2.0),\
+        ("Cooperativa", "https://www.cooperativa.cl", "news", 2.0),\
+        ("Meganoticias", "https://www.meganoticias.cl", "news", 1.5),\
+        \
+        # TV y Radio\
+        ("TVN", "https://www.tvn.cl", "tv", 2.0),\
+        ("Canal13", "https://www.canal13.cl", "tv", 2.0),\
+        ("ADN", "https://www.adnradio.cl", "radio", 2.0),\
+        \
+        # Foros\
+        ("Reddit Chile", "https://www.reddit.com/r/chile", "forum", 2.0),\
+        ("ChileComparte", "https://www.chilecomparte.cl", "forum", 1.0),\
+        \
+        # Blogs\
+        ("FayerWayer", "https://www.fayerwayer.com", "blog", 1.5),\
+        ("El Definido", "https://www.eldefinido.cl", "blog", 1.5),\
+        \
+        # Redes Sociales\
+        ("Twitter", "https://twitter.com", "social", 4.0),\
+        ("Instagram", "https://www.instagram.com", "social", 2.0),\
+        \
+        # Google y sitios p\'fablicos\
+        ("Google Maps", "https://www.google.com/maps", "review", 5.0),\
+        ("ChileCompra", "https://www.chilecompra.cl", "public", 1.0),\
+        \
+        # Sitios de reclamos\
+        ("Reclamos.cl", "https://www.reclamos.cl", "complaint", 6.0),\
+        ("Sernac", "https://www.sernac.cl", "complaint", 4.0),\
+        ("Trustpilot", "https://cl.trustpilot.com", "review", 2.0),\
+    ]\
+    \
+    for source in sources:\
+        try:\
+            cursor.execute(\
+                "INSERT OR IGNORE INTO sources (name, url, category, weight) VALUES (?, ?, ?, ?)",\
+                source\
+            )\
+        except sqlite3.IntegrityError:\
+            # La fuente ya existe\
+            pass\
+\
+# Clase para el an\'e1lisis de sentimiento\
+class SentimentAnalyzer:\
+    def __init__(self):\
+        # En producci\'f3n, cargar un modelo pre-entrenado para espa\'f1ol/chileno\
+        # Para el prototipo, usamos un modelo multiling\'fce b\'e1sico\
+        try:\
+            self.sentiment_pipeline = pipeline(\
+                "sentiment-analysis",\
+                model="nlptown/bert-base-multilingual-uncased-sentiment"\
+            )\
+            logger.info("Modelo de an\'e1lisis de sentimiento cargado correctamente")\
+        except Exception as e:\
+            logger.error(f"Error al cargar el modelo de sentimiento: \{e\}")\
+            # Fallback a un analizador de sentimiento simple basado en reglas\
+            self.sentiment_pipeline = None\
+    \
+    def analyze(self, text):\
+        """Analiza el sentimiento del texto y devuelve -1 (negativo), 0 (neutral) o 1 (positivo)"""\
+        if not text or len(text.strip()) == 0:\
+            return 0\
+        \
+        try:\
+            if self.sentiment_pipeline:\
+                # Usar el modelo de ML\
+                result = self.sentiment_pipeline(text[:512])[0]  # Limitar longitud\
+                score = float(result['label'].split()[0]) / 5.0  # Normalizar a 0-1\
+                \
+                # Convertir a la escala -1, 0, 1\
+                if score < 0.4:\
+                    return -1  # Negativo\
+                elif score > 0.6:\
+                    return 1   # Positivo\
+                else:\
+                    return 0   # Neutral\
+            else:\
+                # Analizador simple basado en reglas\
+                return self._simple_rule_analysis(text)\
+        except Exception as e:\
+            logger.error(f"Error en an\'e1lisis de sentimiento: \{e\}")\
+            return 0  # En caso de error, devolver neutral\
+    \
+    def _simple_rule_analysis(self, text):\
+        """Analizador simple basado en palabras clave para casos donde falla el modelo ML"""\
+        text = text.lower()\
+        \
+        # Palabras positivas y negativas en espa\'f1ol (simplificado)\
+        positive_words = ['bueno', 'excelente', 'genial', 'recomendable', 'positivo', \
+                         'favorable', 'satisfecho', 'calidad', 'satisfacci\'f3n']\
+        \
+        negative_words = ['malo', 'p\'e9simo', 'terrible', 'deficiente', 'negativo', \
+                         'desfavorable', 'insatisfecho', 'problema', 'queja', 'reclamo']\
+        \
+        pos_count = sum(1 for word in positive_words if word in text)\
+        neg_count = sum(1 for word in negative_words if word in text)\
+        \
+        if pos_count > neg_count:\
+            return 1\
+        elif neg_count > pos_count:\
+            return -1\
+        else:\
+            return 0\
+\
+# Clase para el c\'e1lculo del IMRD\
+class IMRDCalculator:\
+    def __init__(self, national_mean=0.3, alpha=10):\
+        self.national_mean = national_mean\
+        self.alpha = alpha\
+    \
+    def calculate(self, brand_mentions):\
+        """Calcula el \'cdndice M&P de Reputaci\'f3n Digital (IMRD)"""\
+        if not brand_mentions:\
+            return 50  # Valor neutral por defecto\
+        \
+        # Suma ponderada del sentimiento\
+        S_marca = sum([m['sentiment'] * m['weight'] for m in brand_mentions])\
+        \
+        # N\'famero total de menciones ponderadas\
+        N_marca = sum([m['weight'] for m in brand_mentions])\
+        \
+        # C\'e1lculo del IMRD seg\'fan la f\'f3rmula\
+        imrd = ((S_marca + self.alpha * self.national_mean) / \
+                (N_marca + self.alpha)) * 100\
+        \
+        # Ajustar al rango 0-100\
+        imrd = max(0, min(100, imrd))\
+        \
+        return imrd\
+\
+# Clase base para scrapers\
+class BaseScraper:\
+    def __init__(self, source_name, weight, sentiment_analyzer):\
+        self.source_name = source_name\
+        self.weight = weight\
+        self.sentiment_analyzer = sentiment_analyzer\
+        self.ua = UserAgent()\
+    \
+    async def search(self, brand_name, days=360):\
+        """M\'e9todo base que debe ser implementado por las subclases"""\
+        raise NotImplementedError("Las subclases deben implementar este m\'e9todo")\
+    \
+    def get_headers(self):\
+        """Obtiene headers aleatorios para evitar detecci\'f3n de scraping"""\
+        return \{\
+            'User-Agent': self.ua.random,\
+            'Accept': 'text/html,application/xhtml+xml,application/xml',\
+            'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',\
+            'Connection': 'keep-alive',\
+        \}\
+    \
+    def save_mentions(self, conn, brand_name, mentions):\
+        """Guarda las menciones en la base de datos"""\
+        cursor = conn.cursor()\
+        for m in mentions:\
+            try:\
+                cursor.execute("""\
+                    INSERT INTO mentions (brand, source, url, text, date, sentiment, weight)\
+                    VALUES (?, ?, ?, ?, ?, ?, ?)\
+                """, (\
+                    brand_name, \
+                    self.source_name, \
+                    m['url'], \
+                    m['text'], \
+                    m['date'], \
+                    m['sentiment'], \
+                    self.weight\
+                ))\
+            except Exception as e:\
+                logger.error(f"Error al guardar menci\'f3n: \{e\}")\
+        conn.commit()\
+\
+# Implementaci\'f3n de scraper para Twitter/X (ejemplo simplificado)\
+class TwitterScraper(BaseScraper):\
+    async def search(self, brand_name, days=360):\
+        """Busca menciones de la marca en Twitter/X"""\
+        logger.info(f"Buscando menciones de \{brand_name\} en Twitter")\
+        \
+        mentions = []\
+        # En una implementaci\'f3n real, se usar\'eda alguna t\'e9cnica como snscrape o Twitter API\
+        # Para el prototipo, generamos datos de ejemplo\
+        \
+        # Generar entre 5-15 menciones aleatorias\
+        for _ in range(random.randint(5, 15)):\
+            sentiment = random.choice([-1, 0, 1])\
+            text = self._generate_sample_tweet(brand_name, sentiment)\
+            \
+            # Fecha aleatoria dentro del rango\
+            days_ago = random.randint(1, days)\
+            date = (datetime.now() - timedelta(days=days_ago)).strftime('%Y-%m-%d')\
+            \
+            mentions.append(\{\
+                'url': f"https://twitter.com/user/status/\{random.randint(1000000000, 9999999999)\}",\
+                'text': text,\
+                'date': date,\
+                'sentiment': sentiment\
+            \})\
+            \
+            # Peque\'f1a pausa para simular scraping real\
+            await asyncio.sleep(0.1)\
+        \
+        return mentions\
+    \
+    def _generate_sample_tweet(self, brand, sentiment):\
+        """Genera un tweet de ejemplo basado en la marca y el sentimiento"""\
+        positive_templates = [\
+            "\'a1Me encanta \{brand\}! Siempre ofrecen un excelente servicio. #Recomendado",\
+            "Acabo de comprar en \{brand\} y qued\'e9 muy satisfecho con su atenci\'f3n. \'a1Volver\'e9!",\
+            "\{brand\} tiene los mejores productos del mercado. Calidad incomparable.",\
+            "La experiencia con \{brand\} fue incre\'edble. Su equipo es muy profesional.",\
+            "Recomiendo 100% a \{brand\}, nunca me han decepcionado."\
+        ]\
+        \
+        neutral_templates = [\
+            "Hoy visit\'e9 \{brand\}. Es una opci\'f3n m\'e1s en el mercado.",\
+            "Alguien ha tenido experiencia con \{brand\}? Estoy pensando en probar.",\
+            "\{brand\} tiene precios similares a la competencia.",\
+            "Informaci\'f3n sobre horarios de atenci\'f3n de \{brand\}?",\
+            "Vi una publicidad de \{brand\} en la calle hoy."\
+        ]\
+        \
+        negative_templates = [\
+            "P\'e9sima experiencia con \{brand\}, no responden a los reclamos.",\
+            "No recomiendo \{brand\}, la calidad ha bajado mucho \'faltimamente.",\
+            "Me decepcion\'f3 \{brand\}, esperaba mucho m\'e1s por el precio que pagu\'e9.",\
+            "Terrible servicio al cliente en \{brand\}. No volver\'e9.",\
+            "Problemas con mi compra en \{brand\}. Nadie se hace responsable."\
+        ]\
+        \
+        if sentiment == 1:\
+            template = random.choice(positive_templates)\
+        elif sentiment == 0:\
+            template = random.choice(neutral_templates)\
+        else:\
+            template = random.choice(negative_templates)\
+        \
+        return template.format(brand=brand)\
+\
+# Implementaci\'f3n de scraper para Reclamos.cl (ejemplo)\
+class ReclamosScraper(BaseScraper):\
+    async def search(self, brand_name, days=360):\
+        """Busca menciones de la marca en Reclamos.cl"""\
+        logger.info(f"Buscando menciones de \{brand_name\} en Reclamos.cl")\
+        \
+        mentions = []\
+        # Simulaci\'f3n de menciones negativas, pues es un sitio de reclamos\
+        for _ in range(random.randint(3, 10)):\
+            text = self._generate_sample_complaint(brand_name)\
+            \
+            # Fecha aleatoria dentro del rango\
+            days_ago = random.randint(1, days)\
+            date = (datetime.now() - timedelta(days=days_ago)).strftime('%Y-%m-%d')\
+            \
+            mentions.append(\{\
+                'url': f"https://www.reclamos.cl/reclamo/r\{random.randint(100000, 999999)\}",\
+                'text': text,\
+                'date': date,\
+                'sentiment': -1  # Generalmente negativo en un sitio de reclamos\
+            \})\
+            \
+            await asyncio.sleep(0.1)\
+        \
+        return mentions\
+    \
+    def _generate_sample_complaint(self, brand):\
+        """Genera un reclamo de ejemplo"""\
+        templates = [\
+            "Compr\'e9 un producto en \{brand\} hace 2 semanas y lleg\'f3 defectuoso. He intentado contactarlos y no responden.",\
+            "P\'e9sima atenci\'f3n al cliente en \{brand\}. Esper\'e9 m\'e1s de 30 minutos para que me atendieran y luego no resolvieron mi problema.",\
+            "\{brand\} cobr\'f3 dos veces por mi compra y no quieren devolver el dinero. Muy mala experiencia.",\
+            "El servicio t\'e9cnico de \{brand\} da\'f1\'f3 m\'e1s mi producto. Ahora no tengo garant\'eda y perd\'ed mi dinero.",\
+            "Hace un mes que estoy esperando la entrega de \{brand\} y no llega. No responden mis correos ni llamadas."\
+        ]\
+        \
+        return random.choice(templates).format(brand=brand)\
+\
+# Implementaci\'f3n de scraper para noticias (ejemplo para Emol)\
+class NewsScraper(BaseScraper):\
+    async def search(self, brand_name, days=360):\
+        """Busca menciones de la marca en medios de noticias"""\
+        logger.info(f"Buscando menciones de \{brand_name\} en \{self.source_name\}")\
+        \
+        mentions = []\
+        # En implementaci\'f3n real, se har\'eda scraping del sitio de noticias\
+        \
+        # Generar menciones de ejemplo\
+        for _ in range(random.randint(2, 8)):\
+            # Variar el sentimiento, pero con tendencia a neutralidad en noticias\
+            sentiment = random.choices([-1, 0, 1], weights=[0.3, 0.5, 0.2])[0]\
+            text = self._generate_sample_news(brand_name, sentiment)\
+            \
+            # Fecha aleatoria dentro del rango\
+            days_ago = random.randint(1, days)\
+            date = (datetime.now() - timedelta(days=days_ago)).strftime('%Y-%m-%d')\
+            \
+            mentions.append(\{\
+                'url': f"https://www.\{self.source_name.lower().replace(' ', '')\}.cl/noticia/\{random.randint(10000, 99999)\}",\
+                'text': text,\
+                'date': date,\
+                'sentiment': sentiment\
+            \})\
+            \
+            await asyncio.sleep(0.1)\
+        \
+        return mentions\
+    \
+    def _generate_sample_news(self, brand, sentiment):\
+        """Genera una noticia de ejemplo basada en la marca y sentimiento"""\
+        if sentiment == 1:\
+            templates = [\
+                "\{brand\} anuncia expansi\'f3n y nuevas contrataciones para el pr\'f3ximo a\'f1o.",\
+                "Exitoso lanzamiento de \{brand\} marca r\'e9cord de ventas en el primer trimestre.",\
+                "\{brand\} recibe premio por innovaci\'f3n empresarial en Chile.",\
+                "Estudios sit\'faan a \{brand\} como l\'edder en satisfacci\'f3n de clientes en su sector.",\
+                "Nueva campa\'f1a de \{brand\} destaca por su compromiso con la sostenibilidad."\
+            ]\
+        elif sentiment == 0:\
+            templates = [\
+                "\{brand\} presenta resultados trimestrales seg\'fan lo esperado por analistas.",\
+                "Cambios en la directiva de \{brand\} buscan mantener su posici\'f3n en el mercado.",\
+                "\{brand\} renueva su cat\'e1logo de productos para la temporada.",\
+                "Entrevista con el CEO de \{brand\} sobre perspectivas del sector.",\
+                "\{brand\} participa en feria empresarial junto a otras marcas del rubro."\
+            ]\
+        else:\
+            templates = [\
+                "\{brand\} enfrenta demanda colectiva por problemas en sus productos.",\
+                "Caen acciones de \{brand\} tras anuncio de resultados por debajo de lo esperado.",\
+                "Trabajadores de \{brand\} anuncian posible huelga por condiciones laborales.",\
+                "Sernac emite alerta por reclamos contra \{brand\} en los \'faltimos meses.",\
+                "Competencia internacional afecta las ventas de \{brand\} en el mercado local."\
+            ]\
+        \
+        return random.choice(templates).format(brand=brand)\
+\
+# Factory para crear scrapers seg\'fan la fuente\
+def create_scraper(source_name, weight, sentiment_analyzer):\
+    """Crea el scraper adecuado seg\'fan la fuente"""\
+    if source_name.lower() in ['twitter', 'x']:\
+        return TwitterScraper(source_name, weight, sentiment_analyzer)\
+    elif 'reclamos' in source_name.lower():\
+        return ReclamosScraper(source_name, weight, sentiment_analyzer)\
+    else:\
+        # Por defecto, usar el scraper de noticias\
+        return NewsScraper(source_name, weight, sentiment_analyzer)\
+\
+# Funci\'f3n para comprobar si un usuario puede hacer una b\'fasqueda (l\'edmite de 1 cada 24h)\
+async def check_search_limit(email):\
+    """Verifica si el usuario ha alcanzado el l\'edmite de b\'fasquedas gratuitas"""\
+    conn = get_db_connection()\
+    cursor = conn.cursor()\
+    \
+    # Buscar usuario por email\
+    cursor.execute("SELECT email, last_search FROM users WHERE email = ?", (email,))\
+    user = cursor.fetchone()\
+    \
+    if user:\
+        # Verificar \'faltima b\'fasqueda\
+        last_search = datetime.fromisoformat(user['last_search']) if user['last_search'] else None\
+        now = datetime.now()\
+        \
+        if last_search and (now - last_search).total_seconds() < 24 * 60 * 60:\
+            conn.close()\
+            return False\
+    \
+    conn.close()\
+    return True\
+\
+# Funci\'f3n principal para realizar la b\'fasqueda de una marca\
+async def perform_search(brand_name, user_data):\
+    """Realiza la b\'fasqueda completa de una marca en todas las fuentes"""\
+    logger.info(f"Iniciando b\'fasqueda para marca: \{brand_name\}")\
+    \
+    # Inicializar analizador de sentimiento\
+    sentiment_analyzer = SentimentAnalyzer()\
+    \
+    # Obtener todas las fuentes de la base de datos\
+    conn = get_db_connection()\
+    cursor = conn.cursor()\
+    cursor.execute("SELECT name, category, weight FROM sources")\
+    sources = cursor.fetchall()\
+    \
+    # Registrar b\'fasqueda del usuario\
+    try:\
+        cursor.execute("""\
+            INSERT INTO users (name, company, email, phone, last_search, search_count)\
+            VALUES (?, ?, ?, ?, ?, 1)\
+            ON CONFLICT(email) DO UPDATE SET\
+                last_search = ?,\
+                search_count = search_count + 1\
+        """, (\
+            user_data['name'], \
+            user_data['company'], \
+            user_data['email'], \
+            user_data['phone'],\
+            datetime.now().isoformat(),\
+            datetime.now().isoformat()\
+        ))\
+        conn.commit()\
+    except Exception as e:\
+        logger.error(f"Error al registrar usuario: \{e\}")\
+    \
+    # Colecci\'f3n para todas las menciones\
+    all_mentions = []\
+    \
+    # Buscar en cada fuente\
+    for source in sources:\
+        try:\
+            scraper = create_scraper(source['name'], source['weight'], sentiment_analyzer)\
+            mentions = await scraper.search(brand_name)\
+            \
+            # Analizar el sentimiento si no est\'e1 ya definido\
+            for mention in mentions:\
+                if 'sentiment' not in mention:\
+                    mention['sentiment'] = sentiment_analyzer.analyze(mention['text'])\
+            \
+            # Guardar en base de datos\
+            scraper.save_mentions(conn, brand_name, mentions)\
+            \
+            # A\'f1adir a la colecci\'f3n total\
+            all_mentions.extend(mentions)\
+            \
+            # Simular tiempo de procesamiento (eliminar en producci\'f3n)\
+            await asyncio.sleep(random.uniform(0.5, 2.0))\
+            \
+        except Exception as e:\
+            logger.error(f"Error al buscar en \{source['name']\}: \{e\}")\
+    \
+    # Calcular el IMRD\
+    calculator = IMRDCalculator()\
+    imrd_score = calculator.calculate(all_mentions)\
+    \
+    # Calcular estad\'edsticas adicionales\
+    total_mentions = len(all_mentions)\
+    positive_mentions = sum(1 for m in all_mentions if m['sentiment'] > 0)\
+    negative_mentions = sum(1 for m in all_mentions if m['sentiment'] < 0)\
+    neutral_mentions = total_mentions - positive_mentions - negative_mentions\
+    \
+    positive_ratio = positive_mentions / total_mentions if total_mentions > 0 else 0\
+    negative_ratio = negative_mentions / total_mentions if total_mentions > 0 else 0\
+    neutral_ratio = neutral_mentions / total_mentions if total_mentions > 0 else 0\
+    \
+    # Guardar resultados en la base de datos\
+    try:\
+        cursor.execute("""\
+            INSERT INTO brand_scores (brand, imrd_score, mention_count, positive_ratio, \
+                                    negative_ratio, neutral_ratio)\
+            VALUES (?, ?, ?, ?, ?, ?)\
+        """, (\
+            brand_name, imrd_score, total_mentions, positive_ratio, negative_ratio, neutral_ratio\
+        ))\
+        conn.commit()\
+    except Exception as e:\
+        logger.error(f"Error al guardar score de marca: \{e\}")\
+    \
+    conn.close()\
+    \
+    # Preparar resultados\
+    result = \{\
+        'brand': brand_name,\
+        'imrd_score': round(imrd_score, 2),\
+        'mention_count': total_mentions,\
+        'sentiment': \{\
+            'positive': round(positive_ratio * 100, 2),\
+            'neutral': round(neutral_ratio * 100, 2),\
+            'negative': round(negative_ratio * 100, 2)\
+        \},\
+        'mentions': [\
+            \{\
+                'source': m['source'] if 'source' in m else 'unknown',\
+                'text': m['text'],\
+                'date': m['date'],\
+                'url': m['url'],\
+                'sentiment': 'positivo' if m['sentiment'] > 0 else 'negativo' if m['sentiment'] < 0 else 'neutral'\
+            \}\
+            for m in sorted(all_mentions, key=lambda x: x['date'], reverse=True)[:20]  # \'daltimas 20 menciones\
+        ],\
+        'reputation_category': get_reputation_category(imrd_score),\
+        'timestamp': datetime.now().isoformat()\
+    \}\
+    \
+    logger.info(f"B\'fasqueda completada para \{brand_name\}. IMRD: \{imrd_score:.2f\}")\
+    \
+    return result\
+\
+def get_reputation_category(imrd_score):\
+    """Determina la categor\'eda de reputaci\'f3n seg\'fan el IMRD"""\
+    if imrd_score < 20:\
+        return "Muy negativa"\
+    elif imrd_score < 40:\
+        return "Negativa"\
+    elif imrd_score < 60:\
+        return "Neutra"\
+    elif imrd_score < 80:\
+        return "Positiva"\
+    else:\
+        return "Excelente"\
+\
+# Rutas de la API\
+@app.get("/")\
+async def read_root(request: Request):\
+    """Ruta principal para la p\'e1gina de inicio"""\
+    return templates.TemplateResponse("index.html", \{"request": request\})\
+\
+@app.post("/api/search", response_model=SearchResult)\
+async def search_brand(search: BrandSearch, background_tasks: BackgroundTasks):\
+    """Inicia una b\'fasqueda de marca"""\
+    # Verificar l\'edmite de b\'fasquedas\
+    if not await check_search_limit(search.email):\
+        raise HTTPException(\
+            status_code=429, \
+            detail="Solo se permite 1 b\'fasqueda gratuita cada 24 horas"\
+        )\
+    \
+    # Generar ID \'fanico para la tarea\
+    task_id = str(uuid4())\
+    \
+    # Preparar datos de usuario\
+    user_data = \{\
+        'name': search.name,\
+        'company': search.company,\
+        'email': search.email,\
+        'phone': search.phone\
+    \}\
+    \
+    # Crear tarea as\'edncrona\
+    task = asyncio.create_task(perform_search(search.brand, user_data))\
+    active_tasks[task_id] = task\
+    \
+    # Configurar limpieza de tareas completadas despu\'e9s de un tiempo\
+    background_tasks.add_task(cleanup_task, task_id, 60*60)  # Limpiar despu\'e9s de 1 hora\
+    \
+    return \{\
+        "task_id": task_id,\
+        "status": "processing",\
+        "message": "Analizando menciones p\'fablicas. Esto puede tardar entre 2 y 8 minutos...",\
+        "data": None\
+    \}\
+\
+@app.get("/api/results/\{task_id\}", response_model=SearchResult)\
+async def get_results(task_id: str):\
+    """Obtiene los resultados de una b\'fasqueda en proceso"""\
+    if task_id not in active_tasks:\
+        raise HTTPException(status_code=404, detail="B\'fasqueda no encontrada")\
+    \
+    task = active_tasks[task_id]\
+    \
+    if task.done():\
+        try:\
+            result = task.result()\
+            return \{\
+                "task_id": task_id,\
+                "status": "completed",\
+                "message": "An\'e1lisis completado exitosamente",\
+                "data": result\
+            \}\
+        except Exception as e:\
+            logger.error(f"Error al obtener resultados: \{e\}")\
+            return \{\
+                "task_id": task_id,\
+                "status": "error",\
+                "message": f"Error en el an\'e1lisis: \{str(e)\}",\
+                "data": None\
+            \}\
+    else:\
+        return \{\
+            "task_id": task_id,\
+            "status": "processing",\
+            "message": "Analizando menciones p\'fablicas. Esto puede tardar entre 2 y 8 minutos...",\
+            "data": None\
+        \}\
+\
+@app.get("/api/brands/ranking")\
+async def get_brand_ranking():\
+    """Obtiene el ranking de marcas seg\'fan su IMRD"""\
+    conn = get_db_connection()\
+    cursor = conn.cursor()\
+    \
+    cursor.execute("""\
+        SELECT brand, imrd_score, mention_count, positive_ratio, negative_ratio, neutral_ratio\
+        FROM brand_scores\
+        ORDER BY imrd_score DESC\
+        LIMIT 10\
+    """)\
+    \
+    brands = []\
+    for row in cursor.fetchall():\
+        brands.append(\{\
+            'brand': row['brand'],\
+            'imrd_score': row['imrd_score'],\
+            'mention_count': row['mention_count'],\
+            'sentiment': \{\
+                'positive': round(row['positive_ratio'] * 100, 2),\
+                'neutral': round(row['neutral_ratio'] * 100, 2),\
+                'negative': round(row['negative_ratio'] * 100, 2)\
+            \},\
+            'reputation_category': get_reputation_category(row['imrd_score'])\
+        \})\
+    \
+    conn.close()\
+    \
+    return \{\
+        "ranking": brands,\
+        "timestamp": datetime.now().isoformat()\
+    \}\
+\
+async def cleanup_task(task_id, delay_seconds):\
+    """Limpia las tareas completadas despu\'e9s de un tiempo"""\
+    await asyncio.sleep(delay_seconds)\
+    if task_id in active_tasks:\
+        del active_tasks[task_id]\
+\
+# Inicializaci\'f3n al arrancar\
+@app.on_event("startup")\
+async def startup_event():\
+    """Inicializa recursos al iniciar la aplicaci\'f3n"""\
+    # Inicializar base de datos\
+    init_db()\
+    logger.info("Aplicaci\'f3n iniciada correctamente")\
+\
+# Inicio de la aplicaci\'f3n\
+if __name__ == "__main__":\
+    import uvicorn\
+    uvicorn.run(app, host="0.0.0.0", port=8000)}
